@@ -1,67 +1,68 @@
-// Deno Deploy Full Porting: VLESS / Trojan / VMess / Shadowsocks
+// Deno Deploy VLESS Server with Proxy Bank & DoH Outbound
 // Entrypoint: main.js
 
-const horse = "dHJvamFu";
-const flash = "dm1lc3M=";
-const neko = "dmxlc3M=";
+const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
 
-const DEFAULT_CONFIG = {
-  DEFAULT_PROXY: "172.232.249.224:2053",
-  DNS_DOH: "https://cloudflare-dns.com/dns-query"
-};
+let cachedProxyList = [];
+let lastFetchTime = 0;
 
-function parseProxy(proxyStr) {
-  if (!proxyStr) return null;
-  const atSplit = proxyStr.split("@");
-  const hostPort = atSplit[0];
-  const auth = atSplit[1] || null;
-
-  let [host, port] = hostPort.split(":");
-  port = parseInt(port, 10) || 443;
-
-  let user = null;
-  let pass = null;
-  if (auth && auth.includes(":")) {
-    const authParts = auth.split(":");
-    user = authParts[0];
-    pass = authParts.slice(1).join(":");
+// Ambil list proxy segar dari Bank TXT
+async function getFreshProxies() {
+  const now = Date.now();
+  if (cachedProxyList.length > 0 && now - lastFetchTime < 10 * 60 * 1000) {
+    return cachedProxyList;
   }
+  try {
+    const res = await fetch(PRX_BANK_URL);
+    if (res.ok) {
+      const text = await res.text();
+      const lines = text.split("\n").filter(Boolean);
+      const list = lines.map(line => {
+        const [ip, port, cc] = line.split(",");
+        return { ip: ip?.trim(), port: parseInt(port?.trim()) || 443, cc: cc?.trim()?.toUpperCase() };
+      }).filter(p => p.ip && p.port);
+      if (list.length > 0) {
+        cachedProxyList = list;
+        lastFetchTime = now;
+        return cachedProxyList;
+      }
+    }
+  } catch (_) {}
+  return [{ ip: "104.16.248.249", port: 443, cc: "CF" }];
+}
 
-  return { host, port, user, pass };
+function getRandomProxy(list, country = "") {
+  if (!list || list.length === 0) return { ip: "104.16.248.249", port: 443 };
+  if (country) {
+    const filtered = list.filter(p => p.cc === country.toUpperCase());
+    if (filtered.length > 0) return filtered[Math.floor(Math.random() * filtered.length)];
+  }
+  return list[Math.floor(Math.random() * list.length)];
 }
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const APP_DOMAIN = url.hostname;
 
-  // 1. WebSocket Handler (VLESS / Trojan / VMess)
-  const upgrade = req.headers.get("upgrade") || "";
-  if (upgrade.toLowerCase() === "websocket") {
+  if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
     const { socket, response } = Deno.upgradeWebSocket(req);
-    handleWebSocket(socket, url, APP_DOMAIN);
+    handleWebSocketSession(socket, url);
     return response;
   }
 
-  // 2. UI Dashboard Generator
   if (url.pathname === "/" || url.pathname === "/ui") {
-    return new Response(getHtmlDashboard(APP_DOMAIN), {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
+    return new Response(renderUI(APP_DOMAIN), {
+      headers: { "Content-Type": "text/html; charset=utf-8" }
     });
   }
 
   return new Response("Not Found", { status: 404 });
 });
 
-function handleWebSocket(socket, url, appDomain) {
+function handleWebSocketSession(socket, url) {
   let tcpConn = null;
   let isEstablished = false;
-
-  const rawPath = decodeURIComponent(url.pathname).replace(/^\//, "");
-  let targetProxy = DEFAULT_CONFIG.DEFAULT_PROXY;
-
-  if (rawPath && rawPath !== "DIRECT" && rawPath !== "MULTI") {
-    targetProxy = rawPath;
-  }
 
   socket.onmessage = async (event) => {
     if (typeof event.data === "string") return;
@@ -78,40 +79,47 @@ function handleWebSocket(socket, url, appDomain) {
 
     try {
       const parsed = parseClientHeader(chunk);
-      if (!parsed) {
-        socket.close();
+      if (!parsed) return socket.close();
+
+      // Handle query DNS port 53 via DoH agar tidak "Unknown Host"
+      if (parsed.isUDP && parsed.port === 53) {
+        handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
-      // Kirim Response Header VLESS / Trojan balik ke DarkTunnel
+      // Ambil proxy aktif dari Bank Proxy
+      const proxyList = await getFreshProxies();
+      const pathParam = decodeURIComponent(url.pathname).replace(/^\//, "");
+      let targetProxy;
+
+      if (pathParam && pathParam.includes(":")) {
+        const [ip, port] = pathParam.split("@")[0].split(":");
+        targetProxy = { ip, port: parseInt(port) || 443 };
+      } else if (pathParam && pathParam.length === 2) {
+        targetProxy = getRandomProxy(proxyList, pathParam);
+      } else {
+        targetProxy = getRandomProxy(proxyList, "SG");
+      }
+
+      // Hubungkan outbound via CONNECT proxy
+      try {
+        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
+      } catch (_) {
+        tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
+      }
+
+      // Kirim Response Header VLESS balik ke DarkTunnel
       if (parsed.responseHeader) {
         socket.send(parsed.responseHeader);
       }
 
-      // Buka jalur TCP keluar
-      // Catatan: Deno Deploy memerlukan tunneling via Proxy IP agar tidak dicegat firewall
-      const proxyInfo = parseProxy(targetProxy);
-
-      try {
-        tcpConn = await connectViaTunnel(proxyInfo, parsed.address, parsed.port);
-      } catch (err) {
-        // Fallback coba direct connect jika proxy gagal
-        try {
-          tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
-        } catch (_) {
-          socket.close();
-          return;
-        }
-      }
-
       isEstablished = true;
 
-      // Kirim data payload pertama
-      if (parsed.rawClientData && parsed.rawClientData.byteLength > 0) {
+      if (parsed.rawClientData?.byteLength > 0) {
         await tcpConn.write(parsed.rawClientData);
       }
 
-      // Pipe balik data dari TCP target ke WebSocket DarkTunnel
+      // Pipe data dari target web balik ke DarkTunnel
       (async () => {
         const buf = new Uint8Array(65536);
         try {
@@ -120,9 +128,7 @@ function handleWebSocket(socket, url, appDomain) {
             if (bytesRead === null) break;
             if (socket.readyState === WebSocket.OPEN) {
               socket.send(buf.subarray(0, bytesRead));
-            } else {
-              break;
-            }
+            } else break;
           }
         } catch (_) {
         } finally {
@@ -136,153 +142,101 @@ function handleWebSocket(socket, url, appDomain) {
   };
 
   socket.onclose = () => {
-    if (tcpConn) {
-      try { tcpConn.close(); } catch (_) {}
-    }
+    if (tcpConn) try { tcpConn.close(); } catch (_) {}
   };
-
   socket.onerror = () => {
-    if (tcpConn) {
-      try { tcpConn.close(); } catch (_) {}
-    }
+    if (tcpConn) try { tcpConn.close(); } catch (_) {}
   };
 }
 
-async function connectViaTunnel(proxy, targetHost, targetPort) {
-  const conn = await Deno.connect({ hostname: proxy.host, port: proxy.port });
-  let connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
-
-  if (proxy.user && proxy.pass) {
-    const auth = btoa(`${proxy.user}:${proxy.pass}`);
-    connectReq += `Proxy-Authorization: Basic ${auth}\r\n`;
-  }
-  connectReq += `User-Agent: Deno-Deploy-Engine\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
-
-  await conn.write(new TextEncoder().encode(connectReq));
+async function connectViaProxy(proxy, targetHost, targetPort) {
+  const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: DenoTunnel\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  await conn.write(new TextEncoder().encode(req));
 
   const buf = new Uint8Array(1024);
-  const bytesRead = await conn.read(buf);
-  if (!bytesRead) throw new Error("Empty proxy response");
+  const n = await conn.read(buf);
+  if (!n) throw new Error("Empty proxy reply");
 
-  const resp = new TextDecoder().decode(buf.subarray(0, bytesRead));
-  if (!resp.includes(" 200 ")) {
-    throw new Error(`Proxy rejected CONNECT: ${resp.split("\r\n")[0]}`);
-  }
-
+  const res = new TextDecoder().decode(buf.subarray(0, n));
+  if (!res.includes(" 200 ")) throw new Error("Proxy reject");
   return conn;
+}
+
+async function handleDnsQuery(socket, queryData, respHeader) {
+  try {
+    const res = await fetch(DOH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/dns-message" },
+      body: queryData
+    });
+    if (res.ok && socket.readyState === WebSocket.OPEN) {
+      const dnsBuf = new Uint8Array(await res.arrayBuffer());
+      if (respHeader) {
+        const full = new Uint8Array(respHeader.byteLength + dnsBuf.byteLength);
+        full.set(respHeader, 0);
+        full.set(dnsBuf, respHeader.byteLength);
+        socket.send(full);
+      } else {
+        socket.send(dnsBuf);
+      }
+    }
+  } catch (_) {}
 }
 
 function parseClientHeader(buffer) {
   if (buffer.byteLength < 18) return null;
-
-  // Cek VLESS
   const version = buffer[0];
-  if (version === 0) {
-    const optLength = buffer[17];
-    const cmd = buffer[18 + optLength];
-    if (cmd !== 1) return null; // Hanya TCP
+  if (version !== 0) return null;
 
-    const portIndex = 18 + optLength + 1;
-    const port = (buffer[portIndex] << 8) | buffer[portIndex + 1];
+  const optLength = buffer[17];
+  const cmd = buffer[18 + optLength];
+  const isUDP = cmd === 2;
 
-    let addrIndex = portIndex + 2;
-    const addrType = buffer[addrIndex];
-    let address = "";
+  const portIndex = 18 + optLength + 1;
+  const port = (buffer[portIndex] << 8) | buffer[portIndex + 1];
 
-    if (addrType === 1) { // IPv4
-      address = `${buffer[addrIndex + 1]}.${buffer[addrIndex + 2]}.${buffer[addrIndex + 3]}.${buffer[addrIndex + 4]}`;
-      addrIndex += 5;
-    } else if (addrType === 2) { // Domain
-      const dLen = buffer[addrIndex + 1];
-      address = new TextDecoder().decode(buffer.slice(addrIndex + 2, addrIndex + 2 + dLen));
-      addrIndex += 2 + dLen;
-    } else if (addrType === 3) { // IPv6
-      const parts = [];
-      const view = new DataView(buffer.buffer, buffer.byteOffset + addrIndex + 1, 16);
-      for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
-      address = parts.join(":");
-      addrIndex += 17;
-    } else {
-      return null;
-    }
+  let addrIndex = portIndex + 2;
+  const addrType = buffer[addrIndex];
+  let address = "";
 
-    return {
-      address,
-      port,
-      rawClientData: buffer.slice(addrIndex),
-      responseHeader: new Uint8Array([version, 0])
-    };
+  if (addrType === 1) {
+    address = `${buffer[addrIndex + 1]}.${buffer[addrIndex + 2]}.${buffer[addrIndex + 3]}.${buffer[addrIndex + 4]}`;
+    addrIndex += 5;
+  } else if (addrType === 2) {
+    const dLen = buffer[addrIndex + 1];
+    address = new TextDecoder().decode(buffer.slice(addrIndex + 2, addrIndex + 2 + dLen));
+    addrIndex += 2 + dLen;
+  } else if (addrType === 3) {
+    const parts = [];
+    const view = new DataView(buffer.buffer, buffer.byteOffset + addrIndex + 1, 16);
+    for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
+    address = parts.join(":");
+    addrIndex += 17;
+  } else {
+    return null;
   }
 
-  // Cek Trojan
-  if (buffer.byteLength >= 62) {
-    const horseDelimiter = buffer.slice(56, 60);
-    if (horseDelimiter[0] === 0x0d && horseDelimiter[1] === 0x0a) {
-      const dataBuffer = buffer.slice(58);
-      const cmd = dataBuffer[0];
-      if (cmd !== 1) return null;
-
-      let addressType = dataBuffer[1];
-      let addrVal = "";
-      let offset = 2;
-
-      if (addressType === 1) {
-        addrVal = `${dataBuffer[2]}.${dataBuffer[3]}.${dataBuffer[4]}.${dataBuffer[5]}`;
-        offset += 4;
-      } else if (addressType === 3) {
-        const len = dataBuffer[2];
-        addrVal = new TextDecoder().decode(dataBuffer.slice(3, 3 + len));
-        offset += 1 + len;
-      }
-
-      const port = (dataBuffer[offset] << 8) | dataBuffer[offset + 1];
-      return {
-        address: addrVal,
-        port,
-        rawClientData: dataBuffer.slice(offset + 4),
-        responseHeader: null
-      };
-    }
-  }
-
-  return null;
+  return {
+    address,
+    port,
+    isUDP,
+    rawClientData: buffer.slice(addrIndex),
+    responseHeader: new Uint8Array([version, 0])
+  };
 }
 
-function getHtmlDashboard(domain) {
+function renderUI(domain) {
   return `<!DOCTYPE html>
-<html lang="id">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Deno Deploy VLESS</title>
-  <style>
-    body { background: #0b0f19; color: #00ffcc; font-family: monospace; padding: 20px; display: flex; justify-content: center; }
-    .box { background: #111827; border: 1px solid #00ffcc; border-radius: 8px; padding: 20px; max-width: 480px; width: 100%; }
-    input, select { width: 100%; padding: 10px; margin: 8px 0; background: #000; border: 1px solid #00ffcc; color: #fff; border-radius: 4px; box-sizing: border-box; }
-    button { width: 100%; padding: 10px; background: #00ffcc; color: #000; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }
-    .out { background: #000; border: 1px dashed #00ffcc; padding: 10px; margin-top: 15px; word-break: break-all; color: #39ff14; font-size: 0.8rem; }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h3 style="color:#fff; text-align:center;">⚡ DENO VLESS ENGINE</h3>
-    <label>UUID:</label>
-    <input type="text" id="uuid" value="${crypto.randomUUID()}">
-    <label>Proxy Target (IP:Port):</label>
-    <input type="text" id="proxy" value="172.232.249.224:2053">
-    <button onclick="genConfig()">GENERATE VLESS CONFIG</button>
-    <div class="out" id="res" style="display:none;"></div>
-  </div>
-  <script>
-    function genConfig() {
-      const u = document.getElementById('uuid').value.trim();
-      const p = document.getElementById('proxy').value.trim();
-      const link = "vless://" + u + "@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=" + encodeURIComponent("/" + p) + "#Deno-VLESS";
-      const box = document.getElementById('res');
-      box.innerText = link;
-      box.style.display = 'block';
-    }
-  </script>
-</body>
-</html>`;
+<html><head><meta charset="UTF-8"><title>Deno VLESS</title>
+<style>body{background:#0b0f19;color:#00ffcc;font-family:monospace;padding:20px;text-align:center;}
+input{width:90%;max-width:400px;padding:10px;margin:8px;background:#000;border:1px solid #00ffcc;color:#fff;}
+button{padding:10px 20px;background:#00ffcc;color:#000;font-weight:bold;border:none;cursor:pointer;}
+.box{margin-top:15px;word-break:break-all;color:#39ff14;font-size:0.8rem;border:1px dashed #00ffcc;padding:10px;}
+</style></head><body>
+<h2>⚡ DENO PROXY BANK ACTIVE</h2>
+<input id="u" value="${crypto.randomUUID()}"><br>
+<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2FSG#Deno-SG';document.getElementById('res').style.display='block';">GENERATE SG</button>
+<div id="res" class="box" style="display:none;"></div>
+</body></html>`;
 }
