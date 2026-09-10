@@ -1,4 +1,4 @@
-// Deno Deploy VLESS Server - Native JSON Proxy Bank Support
+// Deno Deploy VLESS Server
 // Entrypoint: main.js
 
 const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.json";
@@ -7,7 +7,6 @@ const DOH_URL = "https://cloudflare-dns.com/dns-query";
 let cachedProxyList = [];
 let lastFetchTime = 0;
 
-// Parser khusus format JSON { "CC": ["IP:PORT"] }
 async function getFreshProxies() {
   const now = Date.now();
   if (cachedProxyList.length > 0 && now - lastFetchTime < 10 * 60 * 1000) {
@@ -84,7 +83,8 @@ function handleWebSocketSession(socket, url) {
     if (typeof event.data === "string") return;
     const chunk = new Uint8Array(event.data);
 
-    if (tcpConn && isEstablished) {
+    // Jika TCP sudah jalan, teruskan data dari DarkTunnel langsung ke target
+    if (isEstablished && tcpConn) {
       try {
         await tcpConn.write(chunk);
       } catch (_) {
@@ -97,9 +97,9 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Tangani query DNS UDP port 53
+      // Tangani DNS UDP via DoH
       if (parsed.isUDP && parsed.port === 53) {
-        handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
+        await handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
@@ -107,14 +107,11 @@ function handleWebSocketSession(socket, url) {
       const rawPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
       let targetProxy = null;
 
-      // Cek apakah ada format custom path /ip:port
       if (rawPath.includes(":")) {
         const parts = rawPath.split("@")[0].split(":");
         const ip = parts[0]?.trim();
         const port = parseInt(parts[1]?.trim(), 10);
-        if (ip && !isNaN(port)) {
-          targetProxy = { ip, port };
-        }
+        if (ip && !isNaN(port)) targetProxy = { ip, port };
       } else if (rawPath.length === 2) {
         targetProxy = getRandomProxy(proxyList, rawPath);
       }
@@ -123,7 +120,7 @@ function handleWebSocketSession(socket, url) {
         targetProxy = getRandomProxy(proxyList, "SG");
       }
 
-      // Konek outbound via CONNECT proxy
+      // Hubungkan ke Outbound via CONNECT Proxy
       try {
         tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
       } catch (_) {
@@ -131,53 +128,63 @@ function handleWebSocketSession(socket, url) {
         try {
           tcpConn = await connectViaProxy(fallback, parsed.address, parsed.port);
         } catch (_) {
-          tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
+          return socket.close();
         }
       }
 
-      if (parsed.responseHeader) {
+      // Kirim balik respon header VLESS
+      if (parsed.responseHeader && socket.readyState === WebSocket.OPEN) {
         socket.send(parsed.responseHeader);
       }
 
       isEstablished = true;
 
+      // Kirim initial payload jika ada
       if (parsed.rawClientData?.byteLength > 0) {
         await tcpConn.write(parsed.rawClientData);
       }
 
-      // Pipe data dari target web balik ke DarkTunnel
+      // Stream data balik dari server target ke DarkTunnel
       (async () => {
-        const buf = new Uint8Array(65536);
+        const buf = new Uint8Array(32768);
         try {
-          while (true) {
+          while (isEstablished) {
             const bytesRead = await tcpConn.read(buf);
             if (bytesRead === null) break;
             if (socket.readyState === WebSocket.OPEN) {
               socket.send(buf.subarray(0, bytesRead));
-            } else break;
+            } else {
+              break;
+            }
           }
         } catch (_) {
         } finally {
-          socket.close();
+          isEstablished = false;
+          if (tcpConn) try { tcpConn.close(); } catch (_) {}
+          if (socket.readyState === WebSocket.OPEN) socket.close();
         }
       })();
 
     } catch (_) {
+      isEstablished = false;
+      if (tcpConn) try { tcpConn.close(); } catch (_) {}
       socket.close();
     }
   };
 
   socket.onclose = () => {
+    isEstablished = false;
     if (tcpConn) try { tcpConn.close(); } catch (_) {}
   };
   socket.onerror = () => {
+    isEstablished = false;
     if (tcpConn) try { tcpConn.close(); } catch (_) {}
   };
 }
 
 async function connectViaProxy(proxy, targetHost, targetPort) {
   const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
-  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: DenoTunnel\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
   await conn.write(new TextEncoder().encode(req));
 
   const buf = new Uint8Array(1024);
@@ -198,20 +205,38 @@ async function connectViaProxy(proxy, targetHost, targetPort) {
 
 async function handleDnsQuery(socket, queryData, respHeader) {
   try {
+    let dnsQuery = queryData;
+    // Client VLESS UDP menyertakan 2-byte prefix panjang query
+    if (queryData.byteLength > 2) {
+      const declaredLen = (queryData[0] << 8) | queryData[1];
+      if (declaredLen + 2 === queryData.byteLength) {
+        dnsQuery = queryData.slice(2);
+      }
+    }
+
     const res = await fetch(DOH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
-      body: queryData
+      body: dnsQuery
     });
+
     if (res.ok && socket.readyState === WebSocket.OPEN) {
       const dnsBuf = new Uint8Array(await res.arrayBuffer());
+      const resLen = dnsBuf.byteLength;
+
+      // Bungkus balik paket DNS UDP dengan format 2-byte length
+      const packet = new Uint8Array(2 + resLen);
+      packet[0] = (resLen >> 8) & 0xff;
+      packet[1] = resLen & 0xff;
+      packet.set(dnsBuf, 2);
+
       if (respHeader) {
-        const full = new Uint8Array(respHeader.byteLength + dnsBuf.byteLength);
+        const full = new Uint8Array(respHeader.byteLength + packet.byteLength);
         full.set(respHeader, 0);
-        full.set(dnsBuf, respHeader.byteLength);
+        full.set(packet, respHeader.byteLength);
         socket.send(full);
       } else {
-        socket.send(dnsBuf);
+        socket.send(packet);
       }
     }
   } catch (_) {}
