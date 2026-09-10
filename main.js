@@ -1,27 +1,64 @@
-// Deno Deploy VLESS Server - Pure Direct Connection
+// Deno Deploy VLESS Server with Proxy Bank & Safe Fallback
 // Entrypoint: main.js
 
+const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
+
+let cachedProxyList = [];
+let lastFetchTime = 0;
+
+async function getFreshProxies() {
+  const now = Date.now();
+  if (cachedProxyList.length > 0 && now - lastFetchTime < 10 * 60 * 1000) {
+    return cachedProxyList;
+  }
+  try {
+    const res = await fetch(PRX_BANK_URL);
+    if (res.ok) {
+      const text = await res.text();
+      const lines = text.split("\n").filter(Boolean);
+      const list = lines.map(line => {
+        const [ip, port, cc] = line.split(",");
+        return { ip: ip?.trim(), port: parseInt(port?.trim()) || 443, cc: cc?.trim()?.toUpperCase() };
+      }).filter(p => p.ip && p.port);
+      if (list.length > 0) {
+        cachedProxyList = list;
+        lastFetchTime = now;
+        return cachedProxyList;
+      }
+    }
+  } catch (_) {}
+  return [{ ip: "104.16.248.249", port: 443, cc: "CF" }];
+}
+
+function getRandomProxy(list, country = "") {
+  if (!list || list.length === 0) return { ip: "104.16.248.249", port: 443 };
+  if (country) {
+    const filtered = list.filter(p => p.cc === country.toUpperCase());
+    if (filtered.length > 0) return filtered[Math.floor(Math.random() * filtered.length)];
+  }
+  return list[Math.floor(Math.random() * list.length)];
+}
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
 
   if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
     const { socket, response } = Deno.upgradeWebSocket(req);
-    handleWebSocketSession(socket);
+    handleWebSocketSession(socket, url);
     return response;
   }
 
   if (url.pathname === "/" || url.pathname === "/ui") {
     return new Response(renderUI(url.hostname), {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
+      headers: { "Content-Type": "text/html; charset=utf-8" }
     });
   }
 
   return new Response("Not Found", { status: 404 });
 });
 
-function handleWebSocketSession(socket) {
+function handleWebSocketSession(socket, url) {
   let tcpConn = null;
   let isEstablished = false;
 
@@ -42,17 +79,38 @@ function handleWebSocketSession(socket) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Tangani query DNS port 53 via DoH Cloudflare
+      // Handle query DNS UDP port 53 via DoH
       if (parsed.isUDP && parsed.port === 53) {
         handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
-      // Konek langsung ke target host secara Direct
-      tcpConn = await Deno.connect({
-        hostname: parsed.address,
-        port: parsed.port,
-      });
+      const proxyList = await getFreshProxies();
+      const pathParam = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
+      let targetProxy = null;
+
+      // Cek apakah path membawa format ip:port
+      if (pathParam && pathParam.includes(":")) {
+        const [ip, port] = pathParam.split("@")[0].split(":");
+        const p = parseInt(port, 10);
+        if (ip && !isNaN(p)) {
+          targetProxy = { ip: ip.trim(), port: p };
+        }
+      } else if (pathParam && pathParam.length === 2) {
+        targetProxy = getRandomProxy(proxyList, pathParam);
+      }
+
+      if (!targetProxy) {
+        targetProxy = getRandomProxy(proxyList, "SG");
+      }
+
+      // Konek via CONNECT proxy pilihan. Kalau gagal/timeout, oper ke proxy bank SG
+      try {
+        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
+      } catch (_) {
+        const fallback = getRandomProxy(proxyList, "SG");
+        tcpConn = await connectViaProxy(fallback, parsed.address, parsed.port);
+      }
 
       if (parsed.responseHeader) {
         socket.send(parsed.responseHeader);
@@ -64,9 +122,8 @@ function handleWebSocketSession(socket) {
         await tcpConn.write(parsed.rawClientData);
       }
 
-      // Pipe data dari target web balik ke DarkTunnel
       (async () => {
-        const buf = new Uint8Array(32768);
+        const buf = new Uint8Array(65536);
         try {
           while (true) {
             const bytesRead = await tcpConn.read(buf);
@@ -94,12 +151,33 @@ function handleWebSocketSession(socket) {
   };
 }
 
+async function connectViaProxy(proxy, targetHost, targetPort) {
+  const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: DenoTunnel\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  await conn.write(new TextEncoder().encode(req));
+
+  const buf = new Uint8Array(1024);
+  const n = await conn.read(buf);
+  if (!n) {
+    try { conn.close(); } catch (_) {}
+    throw new Error("Empty reply");
+  }
+
+  const res = new TextDecoder().decode(buf.subarray(0, n));
+  if (!res.includes(" 200 ")) {
+    try { conn.close(); } catch (_) {}
+    throw new Error("Proxy reject");
+  }
+
+  return conn;
+}
+
 async function handleDnsQuery(socket, queryData, respHeader) {
   try {
     const res = await fetch(DOH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
-      body: queryData,
+      body: queryData
     });
     if (res.ok && socket.readyState === WebSocket.OPEN) {
       const dnsBuf = new Uint8Array(await res.arrayBuffer());
@@ -153,21 +231,21 @@ function parseClientHeader(buffer) {
     port,
     isUDP,
     rawClientData: buffer.slice(addrIndex),
-    responseHeader: new Uint8Array([version, 0]),
+    responseHeader: new Uint8Array([version, 0])
   };
 }
 
 function renderUI(domain) {
   return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Deno VLESS Direct</title>
+<html><head><meta charset="UTF-8"><title>Deno VLESS</title>
 <style>body{background:#0b0f19;color:#00ffcc;font-family:monospace;padding:20px;text-align:center;}
 input{width:90%;max-width:400px;padding:10px;margin:8px;background:#000;border:1px solid #00ffcc;color:#fff;}
 button{padding:10px 20px;background:#00ffcc;color:#000;font-weight:bold;border:none;cursor:pointer;}
 .box{margin-top:15px;word-break:break-all;color:#39ff14;font-size:0.8rem;border:1px dashed #00ffcc;padding:10px;}
 </style></head><body>
-<h2>⚡ DENO DIRECT ACTIVE</h2>
+<h2>⚡ DENO PROXY BANK ACTIVE</h2>
 <input id="u" value="${crypto.randomUUID()}"><br>
-<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F#Deno-Direct';document.getElementById('res').style.display='block';">GENERATE LINK</button>
+<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F66.33.22.221%3A44420#Deno-Custom';document.getElementById('res').style.display='block';">GENERATE LINK</button>
 <div id="res" class="box" style="display:none;"></div>
 </body></html>`;
 }
