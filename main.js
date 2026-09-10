@@ -1,44 +1,8 @@
-// Deno Deploy VLESS Server with Working DNS Handler
+// Deno Deploy VLESS Server - High Reliability Outbound
 // Entrypoint: main.js
 
-const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
-
-let cachedProxyList = [];
-let lastFetchTime = 0;
-
-async function getFreshProxies() {
-  const now = Date.now();
-  if (cachedProxyList.length > 0 && now - lastFetchTime < 10 * 60 * 1000) {
-    return cachedProxyList;
-  }
-  try {
-    const res = await fetch(PRX_BANK_URL);
-    if (res.ok) {
-      const text = await res.text();
-      const lines = text.split("\n").filter(Boolean);
-      const list = lines.map(line => {
-        const [ip, port, cc] = line.split(",");
-        return { ip: ip?.trim(), port: parseInt(port?.trim(), 10) || 443, cc: cc?.trim()?.toUpperCase() };
-      }).filter(p => p.ip && p.port);
-      if (list.length > 0) {
-        cachedProxyList = list;
-        lastFetchTime = now;
-        return cachedProxyList;
-      }
-    }
-  } catch (_) {}
-  return [{ ip: "104.16.248.249", port: 443, cc: "CF" }];
-}
-
-function getRandomProxy(list, country = "") {
-  if (!list || list.length === 0) return { ip: "104.16.248.249", port: 443 };
-  if (country) {
-    const filtered = list.filter(p => p.cc === country.toUpperCase());
-    if (filtered.length > 0) return filtered[Math.floor(Math.random() * filtered.length)];
-  }
-  return list[Math.floor(Math.random() * list.length)];
-}
+const BACKUP_CF_IPS = ["104.16.248.249", "104.16.132.229", "172.67.73.1", "104.21.16.1"];
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
@@ -79,37 +43,46 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Tangani query DNS UDP port 53
+      // Tangani DNS UDP port 53 via DoH
       if (parsed.isUDP && parsed.port === 53) {
         handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
-      const proxyList = await getFreshProxies();
-      const rawPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
-      let targetProxy = null;
+      // Ambil path proxy jika formatnya /ip:port
+      const cleanPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
+      let customProxy = null;
 
-      if (rawPath.includes(":")) {
-        const parts = rawPath.split("@")[0].split(":");
-        const ip = parts[0]?.trim();
-        const port = parseInt(parts[1]?.trim(), 10);
-        if (ip && !isNaN(port)) {
-          targetProxy = { ip, port };
+      if (cleanPath.includes(":")) {
+        const [ip, port] = cleanPath.split("@")[0].split(":");
+        const p = parseInt(port, 10);
+        if (ip && !isNaN(p)) {
+          customProxy = { ip: ip.trim(), port: p };
         }
-      } else if (rawPath.length === 2) {
-        targetProxy = getRandomProxy(proxyList, rawPath);
       }
 
-      if (!targetProxy) {
-        targetProxy = getRandomProxy(proxyList, "SG");
+      // 1. Coba konek lewat Custom Proxy jika disediakan (timeout keras 1.5 detik)
+      if (customProxy) {
+        try {
+          tcpConn = await connectWithTimeout(customProxy, parsed.address, parsed.port, 1500);
+        } catch (_) {
+          tcpConn = null;
+        }
       }
 
-      // Hubungkan outbound via CONNECT proxy, fallback ke proxy SG
-      try {
-        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
-      } catch (_) {
-        const fallback = getRandomProxy(proxyList, "SG");
-        tcpConn = await connectViaProxy(fallback, parsed.address, parsed.port);
+      // 2. Jika custom proxy gagal / tidak ada, langsung gunakan Fallback IP Cloudflare
+      if (!tcpConn) {
+        for (const cfIp of BACKUP_CF_IPS) {
+          try {
+            tcpConn = await connectWithTimeout({ ip: cfIp, port: 443 }, parsed.address, parsed.port, 2000);
+            if (tcpConn) break;
+          } catch (_) {}
+        }
+      }
+
+      // 3. Fallback terakhir jika semua gagal
+      if (!tcpConn) {
+        tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
       }
 
       if (parsed.responseHeader) {
@@ -122,6 +95,7 @@ function handleWebSocketSession(socket, url) {
         await tcpConn.write(parsed.rawClientData);
       }
 
+      // Pipe data dari outbound balik ke client
       (async () => {
         const buf = new Uint8Array(65536);
         try {
@@ -151,9 +125,16 @@ function handleWebSocketSession(socket, url) {
   };
 }
 
+function connectWithTimeout(proxy, targetHost, targetPort, ms) {
+  return Promise.race([
+    connectViaProxy(proxy, targetHost, targetPort),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+  ]);
+}
+
 async function connectViaProxy(proxy, targetHost, targetPort) {
   const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
-  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: DenoTunnel\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
   await conn.write(new TextEncoder().encode(req));
 
   const buf = new Uint8Array(1024);
@@ -172,45 +153,22 @@ async function connectViaProxy(proxy, targetHost, targetPort) {
   return conn;
 }
 
-// Handler DNS UDP yang kompatibel dengan protokol VLESS
 async function handleDnsQuery(socket, queryData, respHeader) {
   try {
-    if (queryData.byteLength < 2) return;
-
-    // Paket DNS UDP VLESS diawali dengan 2-byte length prefix
-    const dnsLen = (queryData[0] << 8) | queryData[1];
-    let rawDns;
-    
-    // Validasi apakah 2 byte pertama memang panjang paket
-    if (dnsLen + 2 === queryData.byteLength) {
-      rawDns = queryData.slice(2);
-    } else {
-      rawDns = queryData;
-    }
-
     const res = await fetch(DOH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
-      body: rawDns
+      body: queryData
     });
-
     if (res.ok && socket.readyState === WebSocket.OPEN) {
       const dnsBuf = new Uint8Array(await res.arrayBuffer());
-      const resLen = dnsBuf.byteLength;
-
-      // Buat frame respons UDP: [2 byte length] + [DNS binary payload]
-      const udpPayload = new Uint8Array(2 + resLen);
-      udpPayload[0] = (resLen >> 8) & 0xff;
-      udpPayload[1] = resLen & 0xff;
-      udpPayload.set(dnsBuf, 2);
-
       if (respHeader) {
-        const full = new Uint8Array(respHeader.byteLength + udpPayload.byteLength);
+        const full = new Uint8Array(respHeader.byteLength + dnsBuf.byteLength);
         full.set(respHeader, 0);
-        full.set(udpPayload, respHeader.byteLength);
+        full.set(dnsBuf, respHeader.byteLength);
         socket.send(full);
       } else {
-        socket.send(udpPayload);
+        socket.send(dnsBuf);
       }
     }
   } catch (_) {}
@@ -266,7 +224,7 @@ input{width:90%;max-width:400px;padding:10px;margin:8px;background:#000;border:1
 button{padding:10px 20px;background:#00ffcc;color:#000;font-weight:bold;border:none;cursor:pointer;}
 .box{margin-top:15px;word-break:break-all;color:#39ff14;font-size:0.8rem;border:1px dashed #00ffcc;padding:10px;}
 </style></head><body>
-<h2>⚡ DENO PROXY BANK ACTIVE</h2>
+<h2>⚡ DENO PROXY ACTIVE</h2>
 <input id="u" value="${crypto.randomUUID()}"><br>
 <button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F#Deno';document.getElementById('res').style.display='block';">GENERATE LINK</button>
 <div id="res" class="box" style="display:none;"></div>
