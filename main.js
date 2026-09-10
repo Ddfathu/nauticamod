@@ -1,4 +1,4 @@
-// Deno Deploy / Deno CLI VLESS Server
+// Deno Deploy VLESS Server
 // Entrypoint: main.js
 
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
@@ -43,16 +43,15 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Tangani query DNS port 53 via DoH Cloudflare
+      // Tangani query DNS port 53 (langsung DoH format DarkTunnel)
       if (parsed.isUDP && parsed.port === 53) {
         handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
-      // Parsing path format /ip:port (misal: /66.33.22.221:44420)
-      const cleanPath = url.pathname.replace(/^\/+|\/+$/g, "").split("?")[0];
+      // Parsing IP dan Port dari Path URL
       let targetProxy = DEFAULT_PROXY;
-
+      const cleanPath = url.pathname.replace(/^\/+|\/+$/g, "").split("?")[0];
       if (cleanPath.includes(":")) {
         const parts = cleanPath.split("@")[0].split(":");
         const ip = parts[0]?.trim();
@@ -62,28 +61,22 @@ function handleWebSocketSession(socket, url) {
         }
       }
 
-      // Optimasi Ping: Coba direct connection dulu, fallback ke Proxy CONNECT
-      try {
-        tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
-      } catch (_) {
-        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
-      }
+      // Langsung hubungkan ke Proxy Outbound tanpa delay
+      tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
 
-      // Kirim Response Header VLESS balik ke client
       if (parsed.responseHeader) {
         socket.send(parsed.responseHeader);
       }
 
       isEstablished = true;
 
-      // Kirim initial data payload jika ada
       if (parsed.rawClientData?.byteLength > 0) {
         await tcpConn.write(parsed.rawClientData);
       }
 
-      // Pipa data dari target/proxy balik ke client WebSocket
+      // Pipe data dari target web balik ke DarkTunnel
       (async () => {
-        const buf = new Uint8Array(32768);
+        const buf = new Uint8Array(65536);
         try {
           while (true) {
             const bytesRead = await tcpConn.read(buf);
@@ -94,7 +87,7 @@ function handleWebSocketSession(socket, url) {
           }
         } catch (_) {
         } finally {
-          if (socket.readyState === WebSocket.OPEN) socket.close();
+          socket.close();
         }
       })();
 
@@ -113,7 +106,7 @@ function handleWebSocketSession(socket, url) {
 
 async function connectViaProxy(proxy, targetHost, targetPort) {
   const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
-  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
   await conn.write(new TextEncoder().encode(req));
 
   const buf = new Uint8Array(1024);
@@ -134,33 +127,21 @@ async function connectViaProxy(proxy, targetHost, targetPort) {
 
 async function handleDnsQuery(socket, queryData, respHeader) {
   try {
-    if (queryData.byteLength < 2) return;
-    // Buang 2 byte length prefix VLESS UDP
-    const dnsQueryPayload = queryData.slice(2);
-
     const res = await fetch(DOH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
-      body: dnsQueryPayload,
+      body: queryData,
     });
 
     if (res.ok && socket.readyState === WebSocket.OPEN) {
       const dnsBuf = new Uint8Array(await res.arrayBuffer());
-      const dnsLen = dnsBuf.byteLength;
-
-      // Sisipkan kembali 2 byte length prefix sebelum dikirim ke client
-      const udpResponse = new Uint8Array(2 + dnsLen);
-      udpResponse[0] = (dnsLen >> 8) & 0xff;
-      udpResponse[1] = dnsLen & 0xff;
-      udpResponse.set(dnsBuf, 2);
-
       if (respHeader) {
-        const full = new Uint8Array(respHeader.byteLength + udpResponse.byteLength);
+        const full = new Uint8Array(respHeader.byteLength + dnsBuf.byteLength);
         full.set(respHeader, 0);
-        full.set(udpResponse, respHeader.byteLength);
+        full.set(dnsBuf, respHeader.byteLength);
         socket.send(full);
       } else {
-        socket.send(udpResponse);
+        socket.send(dnsBuf);
       }
     }
   } catch (_) {}
