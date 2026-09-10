@@ -1,4 +1,4 @@
-// Deno Deploy VLESS Server with Proxy Bank & Safe Fallback
+// Deno Deploy VLESS Server with Strict Proxy Timeout
 // Entrypoint: main.js
 
 const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
@@ -19,7 +19,7 @@ async function getFreshProxies() {
       const lines = text.split("\n").filter(Boolean);
       const list = lines.map(line => {
         const [ip, port, cc] = line.split(",");
-        return { ip: ip?.trim(), port: parseInt(port?.trim()) || 443, cc: cc?.trim()?.toUpperCase() };
+        return { ip: ip?.trim(), port: parseInt(port?.trim(), 10) || 443, cc: cc?.trim()?.toUpperCase() };
       }).filter(p => p.ip && p.port);
       if (list.length > 0) {
         cachedProxyList = list;
@@ -79,37 +79,44 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Handle query DNS UDP port 53 via DoH
       if (parsed.isUDP && parsed.port === 53) {
         handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
       const proxyList = await getFreshProxies();
-      const pathParam = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
+      const rawPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
       let targetProxy = null;
 
-      // Cek apakah path membawa format ip:port
-      if (pathParam && pathParam.includes(":")) {
-        const [ip, port] = pathParam.split("@")[0].split(":");
-        const p = parseInt(port, 10);
-        if (ip && !isNaN(p)) {
-          targetProxy = { ip: ip.trim(), port: p };
+      if (rawPath.includes(":")) {
+        const parts = rawPath.split("@")[0].split(":");
+        const ip = parts[0]?.trim();
+        const port = parseInt(parts[1]?.trim(), 10);
+        if (ip && !isNaN(port)) {
+          targetProxy = { ip, port };
         }
-      } else if (pathParam && pathParam.length === 2) {
-        targetProxy = getRandomProxy(proxyList, pathParam);
+      } else if (rawPath.length === 2) {
+        targetProxy = getRandomProxy(proxyList, rawPath);
       }
 
-      if (!targetProxy) {
-        targetProxy = getRandomProxy(proxyList, "SG");
+      // Coba proxy target dengan timeout ketat 2.5 detik
+      if (targetProxy) {
+        try {
+          tcpConn = await connectWithTimeout(targetProxy, parsed.address, parsed.port, 2500);
+        } catch (_) {
+          tcpConn = null;
+        }
       }
 
-      // Konek via CONNECT proxy pilihan. Kalau gagal/timeout, oper ke proxy bank SG
-      try {
-        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
-      } catch (_) {
+      // Jika proxy path gagal/bengong, langsung fallback ke proxy list GitHub
+      if (!tcpConn) {
         const fallback = getRandomProxy(proxyList, "SG");
-        tcpConn = await connectViaProxy(fallback, parsed.address, parsed.port);
+        try {
+          tcpConn = await connectWithTimeout(fallback, parsed.address, parsed.port, 3000);
+        } catch (_) {
+          const defaultCf = { ip: "104.16.248.249", port: 443 };
+          tcpConn = await connectWithTimeout(defaultCf, parsed.address, parsed.port, 3000);
+        }
       }
 
       if (parsed.responseHeader) {
@@ -149,6 +156,14 @@ function handleWebSocketSession(socket, url) {
   socket.onerror = () => {
     if (tcpConn) try { tcpConn.close(); } catch (_) {}
   };
+}
+
+// Wrapper koneksi dengan batas waktu agar tidak membekukan DarkTunnel
+function connectWithTimeout(proxy, targetHost, targetPort, ms) {
+  return Promise.race([
+    connectViaProxy(proxy, targetHost, targetPort),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+  ]);
 }
 
 async function connectViaProxy(proxy, targetHost, targetPort) {
@@ -245,7 +260,7 @@ button{padding:10px 20px;background:#00ffcc;color:#000;font-weight:bold;border:n
 </style></head><body>
 <h2>⚡ DENO PROXY BANK ACTIVE</h2>
 <input id="u" value="${crypto.randomUUID()}"><br>
-<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F66.33.22.221%3A44420#Deno-Custom';document.getElementById('res').style.display='block';">GENERATE LINK</button>
+<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F#Deno';document.getElementById('res').style.display='block';">GENERATE LINK</button>
 <div id="res" class="box" style="display:none;"></div>
 </body></html>`;
 }
