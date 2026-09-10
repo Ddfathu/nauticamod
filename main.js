@@ -1,8 +1,44 @@
-// Deno Deploy VLESS Server
+// Deno Deploy VLESS Server with Safe Fallback
 // Entrypoint: main.js
 
+const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
-const DEFAULT_PROXY = { ip: "66.33.22.221", port: 44420 };
+
+let cachedProxyList = [];
+let lastFetchTime = 0;
+
+async function getFreshProxies() {
+  const now = Date.now();
+  if (cachedProxyList.length > 0 && now - lastFetchTime < 10 * 60 * 1000) {
+    return cachedProxyList;
+  }
+  try {
+    const res = await fetch(PRX_BANK_URL);
+    if (res.ok) {
+      const text = await res.text();
+      const lines = text.split("\n").filter(Boolean);
+      const list = lines.map(line => {
+        const [ip, port, cc] = line.split(",");
+        return { ip: ip?.trim(), port: parseInt(port?.trim(), 10) || 443, cc: cc?.trim()?.toUpperCase() };
+      }).filter(p => p.ip && p.port);
+      if (list.length > 0) {
+        cachedProxyList = list;
+        lastFetchTime = now;
+        return cachedProxyList;
+      }
+    }
+  } catch (_) {}
+  return [{ ip: "104.16.248.249", port: 443, cc: "CF" }];
+}
+
+function getRandomProxy(list, country = "") {
+  if (!list || list.length === 0) return { ip: "104.16.248.249", port: 443 };
+  if (country) {
+    const filtered = list.filter(p => p.cc === country.toUpperCase());
+    if (filtered.length > 0) return filtered[Math.floor(Math.random() * filtered.length)];
+  }
+  return list[Math.floor(Math.random() * list.length)];
+}
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
@@ -15,7 +51,7 @@ Deno.serve(async (req) => {
 
   if (url.pathname === "/" || url.pathname === "/ui") {
     return new Response(renderUI(url.hostname), {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
+      headers: { "Content-Type": "text/html; charset=utf-8" }
     });
   }
 
@@ -43,17 +79,18 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
-      // Tangani query DNS port 53 (langsung DoH format DarkTunnel)
       if (parsed.isUDP && parsed.port === 53) {
         handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
-      // Parsing IP dan Port dari Path URL
-      let targetProxy = DEFAULT_PROXY;
-      const cleanPath = url.pathname.replace(/^\/+|\/+$/g, "").split("?")[0];
-      if (cleanPath.includes(":")) {
-        const parts = cleanPath.split("@")[0].split(":");
+      const proxyList = await getFreshProxies();
+      const rawPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
+      let targetProxy = null;
+
+      // Parsing format /ip:port
+      if (rawPath.includes(":")) {
+        const parts = rawPath.split("@")[0].split(":");
         const ip = parts[0]?.trim();
         const port = parseInt(parts[1]?.trim(), 10);
         if (ip && !isNaN(port)) {
@@ -61,8 +98,25 @@ function handleWebSocketSession(socket, url) {
         }
       }
 
-      // Langsung hubungkan ke Proxy Outbound tanpa delay
-      tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
+      if (!targetProxy) {
+        if (rawPath.length === 2) {
+          targetProxy = getRandomProxy(proxyList, rawPath);
+        } else {
+          targetProxy = getRandomProxy(proxyList, "SG");
+        }
+      }
+
+      // Coba konek lewat proxy target (66.33.22.221), kalo ditolak otomatis fallback ke SG proxy
+      try {
+        tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
+      } catch (_) {
+        const fallbackProxy = getRandomProxy(proxyList, "SG");
+        try {
+          tcpConn = await connectViaProxy(fallbackProxy, parsed.address, parsed.port);
+        } catch (_) {
+          tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
+        }
+      }
 
       if (parsed.responseHeader) {
         socket.send(parsed.responseHeader);
@@ -74,7 +128,6 @@ function handleWebSocketSession(socket, url) {
         await tcpConn.write(parsed.rawClientData);
       }
 
-      // Pipe data dari target web balik ke DarkTunnel
       (async () => {
         const buf = new Uint8Array(65536);
         try {
@@ -106,19 +159,19 @@ function handleWebSocketSession(socket, url) {
 
 async function connectViaProxy(proxy, targetHost, targetPort) {
   const conn = await Deno.connect({ hostname: proxy.ip, port: proxy.port });
-  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
+  const req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nUser-Agent: DenoTunnel\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
   await conn.write(new TextEncoder().encode(req));
 
   const buf = new Uint8Array(1024);
   const n = await conn.read(buf);
   if (!n) {
-    conn.close();
-    throw new Error("Empty proxy reply");
+    try { conn.close(); } catch (_) {}
+    throw new Error("Empty reply");
   }
 
   const res = new TextDecoder().decode(buf.subarray(0, n));
   if (!res.includes(" 200 ")) {
-    conn.close();
+    try { conn.close(); } catch (_) {}
     throw new Error("Proxy reject");
   }
 
@@ -130,9 +183,8 @@ async function handleDnsQuery(socket, queryData, respHeader) {
     const res = await fetch(DOH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
-      body: queryData,
+      body: queryData
     });
-
     if (res.ok && socket.readyState === WebSocket.OPEN) {
       const dnsBuf = new Uint8Array(await res.arrayBuffer());
       if (respHeader) {
@@ -185,7 +237,7 @@ function parseClientHeader(buffer) {
     port,
     isUDP,
     rawClientData: buffer.slice(addrIndex),
-    responseHeader: new Uint8Array([version, 0]),
+    responseHeader: new Uint8Array([version, 0])
   };
 }
 
@@ -199,7 +251,7 @@ button{padding:10px 20px;background:#00ffcc;color:#000;font-weight:bold;border:n
 </style></head><body>
 <h2>⚡ DENO PROXY ACTIVE</h2>
 <input id="u" value="${crypto.randomUUID()}"><br>
-<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F66.33.22.221%3A44420#Deno-Proxy';document.getElementById('res').style.display='block';">GENERATE LINK</button>
+<button onclick="document.getElementById('res').innerText='vless://'+document.getElementById('u').value+'@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F66.33.22.221%3A44420#Deno-Custom';document.getElementById('res').style.display='block';">GENERATE LINK</button>
 <div id="res" class="box" style="display:none;"></div>
 </body></html>`;
 }
