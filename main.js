@@ -1,8 +1,8 @@
-// Deno Deploy VLESS Server with Safe Fallback
+// Deno Deploy VLESS Server with Hybrid DNS (TCP 53 & Multi-DoH)
 // Entrypoint: main.js
 
 const PRX_BANK_URL = "https://raw.githubusercontent.com/Ddfathu/nauticamod/refs/heads/main/proxy.txt";
-const DOH_URL = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_PROXY = { ip: "66.33.22.221", port: 44420 };
 
 let cachedProxyList = [];
 let lastFetchTime = 0;
@@ -79,16 +79,16 @@ function handleWebSocketSession(socket, url) {
       const parsed = parseClientHeader(chunk);
       if (!parsed) return socket.close();
 
+      // Tangani query DNS port 53 (TCP 53 Outbound + Fallback DoH)
       if (parsed.isUDP && parsed.port === 53) {
-        handleDnsQuery(socket, parsed.rawClientData, parsed.responseHeader);
+        handleDnsHybrid(socket, parsed.rawClientData, parsed.responseHeader);
         return;
       }
 
       const proxyList = await getFreshProxies();
       const rawPath = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, "").split("?")[0];
-      let targetProxy = null;
+      let targetProxy = DEFAULT_PROXY;
 
-      // Parsing format /ip:port
       if (rawPath.includes(":")) {
         const parts = rawPath.split("@")[0].split(":");
         const ip = parts[0]?.trim();
@@ -96,26 +96,16 @@ function handleWebSocketSession(socket, url) {
         if (ip && !isNaN(port)) {
           targetProxy = { ip, port };
         }
+      } else if (rawPath.length === 2) {
+        targetProxy = getRandomProxy(proxyList, rawPath);
       }
 
-      if (!targetProxy) {
-        if (rawPath.length === 2) {
-          targetProxy = getRandomProxy(proxyList, rawPath);
-        } else {
-          targetProxy = getRandomProxy(proxyList, "SG");
-        }
-      }
-
-      // Coba konek lewat proxy target (66.33.22.221), kalo ditolak otomatis fallback ke SG proxy
+      // Hubungkan outbound via CONNECT proxy dengan fallback proxy pool SG
       try {
         tcpConn = await connectViaProxy(targetProxy, parsed.address, parsed.port);
       } catch (_) {
         const fallbackProxy = getRandomProxy(proxyList, "SG");
-        try {
-          tcpConn = await connectViaProxy(fallbackProxy, parsed.address, parsed.port);
-        } catch (_) {
-          tcpConn = await Deno.connect({ hostname: parsed.address, port: parsed.port });
-        }
+        tcpConn = await connectViaProxy(fallbackProxy, parsed.address, parsed.port);
       }
 
       if (parsed.responseHeader) {
@@ -178,25 +168,75 @@ async function connectViaProxy(proxy, targetHost, targetPort) {
   return conn;
 }
 
-async function handleDnsQuery(socket, queryData, respHeader) {
+// Handler DNS Port 53: Coba DNS TCP 53 -> DoH Cloudflare -> DoH Google
+async function handleDnsHybrid(socket, queryData, respHeader) {
+  // 1. Coba DNS over TCP 53 langsung ke 1.1.1.1
   try {
-    const res = await fetch(DOH_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/dns-message" },
-      body: queryData
-    });
-    if (res.ok && socket.readyState === WebSocket.OPEN) {
-      const dnsBuf = new Uint8Array(await res.arrayBuffer());
-      if (respHeader) {
-        const full = new Uint8Array(respHeader.byteLength + dnsBuf.byteLength);
-        full.set(respHeader, 0);
-        full.set(dnsBuf, respHeader.byteLength);
-        socket.send(full);
-      } else {
-        socket.send(dnsBuf);
-      }
+    const dnsTcpConn = await Deno.connect({ hostname: "1.1.1.1", port: 53 });
+    const dnsLen = queryData.byteLength;
+    const tcpReq = new Uint8Array(2 + dnsLen);
+    tcpReq[0] = (dnsLen >> 8) & 0xff;
+    tcpReq[1] = dnsLen & 0xff;
+    tcpReq.set(queryData, 2);
+
+    await dnsTcpConn.write(tcpReq);
+
+    const lenBuf = new Uint8Array(2);
+    await dnsTcpConn.read(lenBuf);
+    const respLen = (lenBuf[0] << 8) | lenBuf[1];
+
+    const respBuf = new Uint8Array(respLen);
+    let bytesRead = 0;
+    while (bytesRead < respLen) {
+      const n = await dnsTcpConn.read(respBuf.subarray(bytesRead));
+      if (n === null) break;
+      bytesRead += n;
+    }
+    dnsTcpConn.close();
+
+    if (bytesRead > 0 && socket.readyState === WebSocket.OPEN) {
+      sendDnsResponse(socket, respBuf.subarray(0, bytesRead), respHeader);
+      return;
     }
   } catch (_) {}
+
+  // 2. Fallback ke DoH jika DNS TCP 53 dibatasi
+  const dohEndpoints = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/dns-query"
+  ];
+
+  for (const endpoint of dohEndpoints) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/dns-message" },
+        body: queryData,
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+
+      if (res.ok && socket.readyState === WebSocket.OPEN) {
+        const dnsBuf = new Uint8Array(await res.arrayBuffer());
+        sendDnsResponse(socket, dnsBuf, respHeader);
+        return;
+      }
+    } catch (_) {}
+  }
+}
+
+function sendDnsResponse(socket, payload, respHeader) {
+  if (respHeader) {
+    const full = new Uint8Array(respHeader.byteLength + payload.byteLength);
+    full.set(respHeader, 0);
+    full.set(payload, respHeader.byteLength);
+    socket.send(full);
+  } else {
+    socket.send(payload);
+  }
 }
 
 function parseClientHeader(buffer) {
